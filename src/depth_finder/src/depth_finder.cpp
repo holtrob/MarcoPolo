@@ -16,137 +16,129 @@
 #include <iostream>
 #include <cmath>
 
+#include <video_node/UVStamped.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
 //Std namepsace to clean up code
 using namespace std;
+using namespace message_filters;
 
-//Declaration of ROS Publishers and Subscribers
-ros::Publisher point;
-ros::Subscriber pcloudsub;
-ros::Subscriber ballstatus;
-ros::Subscriber ballstatus2;
+class BallLocationKeeper {
+    private:
+    bool ball_found;
+    
+    ros::NodeHandle nodeh;
+    
+    ros::Publisher ball_relative_coords_pub;
+    ros::Publisher ball_odom_coords_pub;
+    message_filters::Subscriber<video_node::UVStamped> uv_subscriber;
+    message_filters::Subscriber<sensor_msgs::PointCloud2> pcl_subscriber;
+    typedef sync_policies::ApproximateTime<video_node::UVStamped, sensor_msgs::PointCloud2> UV_PCL2_Policy;
+    typedef Synchronizer<UV_PCL2_Policy> Sync;
+    boost::shared_ptr<Sync> sync;
 
-//Global Variable Declarations for this node
-geometry_msgs::Transform robot;
-geometry_msgs::Transform ball_initial;
-geometry_msgs::PointStamped transformed_pt;
-geometry_msgs::PointStamped world_pt;
-std_msgs::Int16MultiArray ballstate;
+    tf2_ros::Buffer tfBuffer;
+    tf2_ros::TransformListener tfListener;
+    geometry_msgs::PointStamped ball_odom_coords;
 
-//ROS tf2 initialization for tf listener
+    public:
+    BallLocationKeeper(ros::NodeHandle &nh);
+    void find_world_point(const video_node::UVStampedConstPtr& uvs,
+                          const sensor_msgs::PointCloud2ConstPtr& pcl2);
+    void broadcast_ball_coords(const ros::TimerEvent& event);
+};
 
-int data0 = 0;
-int u = 0;
-int v = 0;
-int ball_flag = 0;
+BallLocationKeeper::BallLocationKeeper(ros::NodeHandle &nh)
+    : tfListener(tfBuffer),
+      uv_subscriber(nh, "/marco/ball_uv", 100),
+      pcl_subscriber(nh, "/camera/depth/points", 1)
+    {
+    // Initialize node handle for the whole node/class
+    nodeh = nh;
 
-/**
- * This subscriber publishes a tf for the location of the ball and records it's current state.
- */
-void ballpose(const std_msgs::Int16MultiArray state1)
-{
-    data0 = state1.data[0];
-    u = state1.data[1];
-    v = state1.data[2];
-    static tf2_ros::TransformBroadcaster br;
-    geometry_msgs::TransformStamped ball;
-    ball.header.stamp = ros::Time::now();
-    ball.header.frame_id = "odom";
-    ball.child_frame_id = "ball_position";
-    ball.transform.translation.x = world_pt.point.x;
-    ball.transform.translation.y = world_pt.point.y;
-    ball.transform.translation.z = 0;
-    ball.transform.rotation.x = 0;
-    ball.transform.rotation.y = 0;
-    ball.transform.rotation.z = 0;
-    ball.transform.rotation.w = 1;
-    br.sendTransform(ball);
+    ball_found = false;
+    ball_odom_coords.header.frame_id = "odom";
+
+    // Advertise that geopoint will be sent
+    ball_relative_coords_pub = nh.advertise<geometry_msgs::PointStamped>("/geopoint", 100);
+    ball_odom_coords_pub = nh.advertise<geometry_msgs::PointStamped>("/marco/ball_odom_pt", 100);
+
+    // Define the approximate time sync policy so that we get nearly synched pcls and uvs
+    sync.reset(new Sync(UV_PCL2_Policy(10), uv_subscriber, pcl_subscriber));      
+    sync->registerCallback(boost::bind(&BallLocationKeeper::find_world_point, this, _1, _2));
+    return;
 }
 
+void BallLocationKeeper::broadcast_ball_coords(const ros::TimerEvent& event) {
 
-/**
- * This subscriber looks at point cloud information and takes in information from the object recognition node, and records it to an initial reference point 
- */
-void depth_find(const sensor_msgs::PointCloud2 pCloud)
-{
-    if(data0==1){
+    if(ball_found == false) {
+        return;
+    }
 
-        geometry_msgs::PointStamped initial_pt;
+    // First get tf for current base_footprint (i.e. local) frame ... wait up to 250ms for the next tf
+    try {
+        geometry_msgs::TransformStamped odom_to_basefp;
+        geometry_msgs::PointStamped ball_basefp_coords;
+        odom_to_basefp = tfBuffer.lookupTransform("base_footprint", "odom", ros::Time::now(), ros::Duration(0.25));
+        tf2::doTransform(ball_odom_coords, ball_basefp_coords, odom_to_basefp);
 
-        int width = pCloud.width;
-        int height = pCloud.height;
+        ball_basefp_coords.header.stamp = ros::Time::now();
+        ball_basefp_coords.header.frame_id = "base_footprint";
+        
+        ball_relative_coords_pub.publish(ball_basefp_coords);
+    } catch (tf2::TransformException &ex) {
+        ROS_WARN("Could NOT transform odom to base_footprint: %s", ex.what());
+    }
+
+    // Second broadcast point for odom (i.e. world) frame
+    return;
+}
+
+void BallLocationKeeper::find_world_point(const video_node::UVStampedConstPtr& uvs,
+                                          const sensor_msgs::PointCloud2ConstPtr& pcl2) {
+    ROS_DEBUG_STREAM("Found approximately synched messages. "
+                         << " UVS came at time " << uvs->header.stamp
+                         << " and "
+                         << " PCL2 came at time " << pcl2->header.stamp);
+
+    if(uvs->ball_visible == true) {
+        ROS_DEBUG_STREAM("Ball is visible!");
+        // Define a local point which can be used temporarily to gather point cloud
+        geometry_msgs::PointStamped basefp_pt;
+
+        // Define a TF which will be used to take the point to the world/odometry frame
+        geometry_msgs::TransformStamped camerapcl_to_odom;
+        int width = pcl2->width;
+        int height = pcl2->height;
 
         // Convert from u (column / width), v (row/height) to position in array
-        // where X,Y,Z data starts
-        int arrayPosition = v*pCloud.row_step + u*pCloud.point_step;
+        int point_idx = (uvs->pixel_row * pcl2->row_step) + (uvs->pixel_column * pcl2->point_step);
 
         // compute position in array where x,y,z data start
-        int arrayPosX = arrayPosition + pCloud.fields[0].offset; // X has an offset of 0
-        int arrayPosY = arrayPosition + pCloud.fields[1].offset; // Y has an offset of 4
-        int arrayPosZ = arrayPosition + pCloud.fields[2].offset; // Z has an offset of 8
+        int arrayPosX = point_idx + pcl2->fields[0].offset; // X has an offset of 0
+        int arrayPosY = point_idx + pcl2->fields[1].offset; // Y has an offset of 4
+        int arrayPosZ = point_idx + pcl2->fields[2].offset; // Z has an offset of 8
+        basefp_pt.point.x = pcl2->data[arrayPosX];
+        basefp_pt.point.y = pcl2->data[arrayPosY];
+        basefp_pt.point.z = pcl2->data[arrayPosZ];
 
-        tf2_ros::Buffer tfBuffer2;
-        tf2_ros::TransformListener tfListener(tfBuffer2);
-
-        float x = 0.0;
-        float y = 0.0;
-        float z = 0.0;
-
-
-        memcpy(&y, &pCloud.data[arrayPosX], sizeof(float));
-        memcpy(&y, &pCloud.data[arrayPosY], sizeof(float));
-        memcpy(&x, &pCloud.data[arrayPosZ], sizeof(float));
+        camerapcl_to_odom = tfBuffer.lookupTransform("odom",
+                                                  pcl2->header.frame_id,
+                                                  pcl2->header.stamp,
+                                                  ros::Duration(0.25));
         
-        initial_pt.point.x = x;
-        initial_pt.point.y = y;
-        initial_pt.point.z = z; 
+        tf2::doTransform(basefp_pt, ball_odom_coords, camerapcl_to_odom);
 
+        // Set this flag so that the local frame coords will send cyclically
+        ball_found = true;
 
-        cout<<initial_pt.point.x<<" "<<initial_pt.point.y<<" "<<initial_pt.point.z<<endl;
-
-        ball_flag = 1;
-
-        geometry_msgs::TransformStamped world_coord;
-        try{
-            cout<<"got in geopoint"<<endl;
-            //Listening to transform between robot and world coordinates
-            world_coord = tfBuffer2.lookupTransform("odom", "base_footprint", ros::Time(0), ros::Duration(0.5));
-            
-            //Transform to give relative position of ball to robot translation and rotation
-            if(isnan(initial_pt.point.x)||initial_pt.point.x==0){
-
-            }
-            else{
-                tf2::doTransform(initial_pt, world_pt, world_coord);
-            }
-            cout<<"initial point "<<initial_pt.point.x<<" transformed point "<<transformed_pt.point.x<<endl;
-        }
-        catch (tf2::TransformException &ex) {
-            ROS_WARN("%s", ex.what());
-            cout<<"got here"<<endl;
-        }
+    } else {
+        // Dont do anything with this point because there's no found ball
+        ROS_DEBUG_STREAM("Ball isnt visible ...");
     }
-}
-
-
-/**
- * This function publishes a geometry point to be taken in by the speech node to aloow the robot to state it's relative position to the ball.
- */
-void geometrypoint(){
-    geometry_msgs::Point msg;
-     
-    msg.z = 0.0;
-
-    if(isnan(transformed_pt.point.x)){
-        point.publish(msg);
-        //cout<<"publishing geopoint"<<endl;
-    }
-    else{
-        msg.y = transformed_pt.point.x;
-        msg.x = -transformed_pt.point.y;      
-        point.publish(msg);
-    }      
-    
-    
+    return;
 }
 
 /**
@@ -154,57 +146,14 @@ void geometrypoint(){
  */
 int main(int argc, char **argv)
 {
-  //Node intitialization  
-  ros::init(argc, argv, "depthcloud");
+    //Node intitialization  
+    ros::init(argc, argv, "depthcloud");
+    ros::NodeHandle n;
+    BallLocationKeeper blk(n);
 
-  ros::NodeHandle n;
+    ros::Timer timer = n.createTimer(ros::Duration(0.05), &BallLocationKeeper::broadcast_ball_coords, &blk);
 
-  tf2_ros::Buffer tfBuffer;
-  tf2_ros::TransformListener tfListener(tfBuffer);
-
-  ros::Rate loop_rate(10);
-
-
-  //Ball /tf initialization
-  ball_initial.translation.x = 0;
-  ball_initial.translation.y = 0;
-
-  //Subscribers being started
-  ballstatus = n.subscribe("/marco/ball_uv", 1000, ballpose);
-  //ballstatus2 = n.subscribe("/marco/redball_uv", 1000, depth_find);
-
-  pcloudsub = n.subscribe("/camera/depth/points", 1000, depth_find);
-
-  //Start of publisher
-  point = n.advertise<geometry_msgs::Point>("geopoint", 1000);
-  
-  //Loop for listener, publisher, and ROS transform
-  while(ros::ok()){
-      //Variables for transform
-      geometry_msgs::TransformStamped robot_coord;
-      geometry_msgs::TransformStamped robot_ball_transform;
-      try{
-          cout<<"while loop main"<<endl;
-          //Listening to transform between robot and world coordinates
-          robot_coord = tfBuffer.lookupTransform("base_footprint", "odom", ros::Time(0));
-
-          //Transform to give relative position of ball to robot translation and rotation
-          tf2::doTransform(world_pt, transformed_pt, robot_coord);
-          //cout<<"initial point "<<initial_pt.point.x<<" transformed point "<<transformed_pt.point.x<<endl;
-      }
-      catch (tf2::TransformException &ex) {
-          ROS_WARN("%s", ex.what());
-          ros::Duration(1.0).sleep();
-          continue;
-      }
-
-      ros::spinOnce();
-      loop_rate.sleep();
-      if(ball_flag==1){
-          geometrypoint();
-      }
-      
-  }
+    ros::spin();
 
   return 0;
 }

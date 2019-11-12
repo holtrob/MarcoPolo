@@ -18,6 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
   message_filters
   message_generation
   tf2_geometry_msgs
+  video_node
 )
 
 ## System dependencies are found with CMake's conventions
@@ -75,7 +76,7 @@ find_package(catkin REQUIRED COMPONENTS
 # )
 
 ## Generate added messages and services with any dependencies listed here
-generate_messages(DEPENDENCIES geometry_msgs sensor_msgs std_msgs)
+#generate_messages(DEPENDENCIES geometry_msgs sensor_msgs std_msgs)
 
 ################################################
 ## Declare ROS dynamic reconfigure parameters ##
@@ -106,7 +107,7 @@ generate_messages(DEPENDENCIES geometry_msgs sensor_msgs std_msgs)
 ## LIBRARIES: libraries you create in this project that dependent projects also need
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
-catkin_package(CATKIN_DEPENDS geometry_msgs roscpp rospy sensor_msgs std_msgs)
+catkin_package(CATKIN_DEPENDS geometry_msgs roscpp rospy sensor_msgs std_msgs video_node)
 
 ###########
 ## Build ##
@@ -205,4 +206,3 @@ include_directories(
 # catkin_add_nosetests(test)
 add_executable(depth src/depth_finder.cpp)
 target_link_libraries(depth ${catkin_LIBRARIES})
-add_dependencies(depth depth_finder_generate_messages_cpp)
